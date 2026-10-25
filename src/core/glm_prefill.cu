@@ -2732,6 +2732,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.sh_down, E, FF, M.sh16, FF, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
         }
         S->mark("shexp", s);
+        // the routed-expert projection (STRATA_GLM_ROUTED_PROJ): ffn holds only the shared expert's rows yet - their part
+        // along the projection, so the end of the layer projects the routed experts' part alone
+        if (Ly.proj_r != nullptr) {
+            if (T > F->proj_dot_cap) {
+                err = "glm proj: a prompt chunk of " + std::to_string(T) + " tokens is more than the routed projection's " +
+                      std::to_string(F->proj_dot_cap) + " (a smaller --prefill)";
+                return false;
+            }
+            strata::kernels::glmf::proj_dot_rows(S->ffn, T, E, Ly.proj_r, F->proj_dot, s);
+        }
         sgemm_bf16(Ly.router, NE, E, S->x, E, M.logits, NE, T, 1.0f);
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
@@ -3931,6 +3941,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             add_f32_kernel<<<(unsigned) std::min<int64_t>(4096, (n + 255) / 256), 256, 0, s>>>(S->ffn, calc_sum, n);
             S->mark("moe_calc", s);
         }
+        // ... every routed expert is in ffn now (the device's windows, the CPU's rows, the other part's sum)
+        if (Ly.proj_r != nullptr)
+            strata::kernels::glmf::proj_rows(S->ffn, T, E, nullptr, F->proj_dot, Ly.proj_r, Ly.proj_s, s);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
         if (glmfast::prefill_submit()) glmfast::submit_queued(s);   // (Windows HIP: the experts start now)

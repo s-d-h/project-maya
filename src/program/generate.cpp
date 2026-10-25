@@ -1299,6 +1299,14 @@ static int glm_pack_generate(const Options& o) {
                 shards.push_back(de.path().filename().string() + ":" + std::to_string(de.file_size(ec)));
         std::sort(shards.begin(), shards.end());
         for (const auto& s : shards) id << " " << s;
+        // ... and the routed-expert projection (STRATA_GLM_ROUTED_PROJ): a conversation read with another one, or none,
+        // is not this model's (an FNV-1a of the file; without one the identity is the one it always was)
+        if (const char* pp = getenv("STRATA_GLM_ROUTED_PROJ"); pp != nullptr && *pp != '\0') {
+            std::ifstream pf(pp, std::ios::binary);
+            uint64_t h = 1469598103934665603ull;
+            for (int ch; (ch = pf.get()) != EOF;) h = (h ^ (uint64_t) (unsigned char) ch) * 1099511628211ull;
+            id << " proj=" << std::hex << h << std::dec;
+        }
         return id.str();
     }();
     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"

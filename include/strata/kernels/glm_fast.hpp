@@ -337,6 +337,14 @@ inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s);
 /// ... a layer's late answer into the streams: R[j] += post[j] * part, j < hc (STRATA_GLM_DEFER_CPU)
 void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s);
+/// The routed-expert projection (STRATA_GLM_ROUTED_PROJ): each of the T rows of x (n wide) loses scale times its part
+/// along the unit vector r, counted without the shared expert's - x[t] -= scale * (r.x[t] - r.sub[t] - sub_dot[t]) r,
+/// sub (T x n) and sub_dot (T) each optional.  The edit a directional-ablation LoRA makes to every routed expert's down
+/// projection of a layer (one r and scale for all of them), on their weighted sum.
+void proj_rows(float* x, int T, int n, const float* sub, const float* sub_dot, const float* r, float scale,
+               cudaStream_t s);
+/// ... out[t] = r.x[t] for the T rows of x (the shared expert's part, before the routed experts are added to it)
+void proj_dot_rows(const float* x, int T, int n, const float* r, float* out, cudaStream_t s);
 /// The side stream's copy of the prefetch list (pf_src -> pf_dst, pf_n entries of blob_bytes each).
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.

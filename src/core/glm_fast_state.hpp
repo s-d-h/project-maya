@@ -390,6 +390,11 @@ struct Glm5Model::FastState {
     void *qr_q = nullptr, *attn_q = nullptr;
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
     float* sh_out = nullptr;   // the shared expert's down (n_embd), computed alongside the routed gate/up
+    // the routed-expert projection (STRATA_GLM_ROUTED_PROJ): its layers' unit vectors, and the prompt path's r.shexp
+    // per row (proj_dot_cap rows)
+    float* proj_mem = nullptr;
+    float* proj_dot = nullptr;
+    int proj_dot_cap = 0;
     // prediction quality (the next layer's router on this layer's FFN input)
     std::vector<std::array<int, 8>> pred_of;   // per layer: the prediction made one layer earlier
     std::atomic<uint64_t> pred_n{0}, pred_overlap{0}, pred_miss{0}, pred_miss_hit{0};
@@ -491,6 +496,9 @@ struct Glm5Model::FastState {
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;
         WSlot idx_q_b_x;
+        // STRATA_GLM_ROUTED_PROJ: the routed experts' sum loses proj_s times its part along proj_r (device, n_embd)
+        const float* proj_r = nullptr;
+        float proj_s = 0.0f;
     };
     std::vector<Layer> L;
     // ---- the VRAM tier: per-layer partitions.  A slot is FREE, RESIDENT (in tab), a SPARE (handed to the

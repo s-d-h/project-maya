@@ -520,6 +520,11 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared;
     static const bool prof = getenv("STRATA_GLM_WIN_PROF") != nullptr;
+    if (Ly.proj_r != nullptr) {
+        err = "glm proj: the routed projection (MAYA_GLM_ROUTED_PROJ) is not applied in the window path - not with DFlash2 "
+              "or the one-GPU MTP decode";
+        return false;
+    }
     if (part != 2) {
         gf::MvJob j[3];
         const void* xq0 = (const uint8_t*) W.xq + (size_t) t0 * W.xq_s;

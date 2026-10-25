@@ -467,6 +467,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared, K = g.n_exp_used;
     if (n < 2) return false;
+    if (Ly.proj_r != nullptr) return false;   // STRATA_GLM_ROUTED_PROJ: the rows one by one (fast_moe_experts projects)
     if (n > F->rows_group || F->rows_scr == nullptr || W.mplan_ptr == nullptr || W.tmax < n ||
         (Ly.exl3 && (W.wh == nullptr || !x3::several_ok()))) {
         static std::atomic<bool> told{false};   // (a run with the setting on that never groups should say so; both

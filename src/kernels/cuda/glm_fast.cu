@@ -4010,6 +4010,37 @@ __global__ void moe_cpu_wait_streams_kernel(MoeDev d, int n_embd, const float* p
     }
 }
 
+// the routed-expert projection (proj_rows / proj_dot_rows): a block a row, the dot in a shared-memory tree (256 threads)
+__device__ float proj_block_dot(const float* x, const float* sub, const float* r, int n, float* red) {
+    const int tid = threadIdx.x;
+    float acc = 0.0f;
+    for (int i = tid; i < n; i += blockDim.x) acc += r[i] * (x[i] - (sub != nullptr ? sub[i] : 0.0f));
+    red[tid] = acc;
+    __syncthreads();
+    for (int w = blockDim.x / 2; w > 0; w >>= 1) {
+        if (tid < w) red[tid] += red[tid + w];
+        __syncthreads();
+    }
+    return red[0];
+}
+
+__global__ void __launch_bounds__(256) proj_rows_kernel(float* x, int n, const float* sub, const float* sub_dot,
+                                                        const float* r, float scale) {
+    __shared__ float red[256];
+    const size_t t = blockIdx.x;
+    float* xr = x + t * (size_t) n;
+    const float d = proj_block_dot(xr, sub != nullptr ? sub + t * (size_t) n : nullptr, r, n, red) -
+                    (sub_dot != nullptr ? sub_dot[t] : 0.0f);
+    const float k = scale * d;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) xr[i] -= k * r[i];
+}
+
+__global__ void __launch_bounds__(256) proj_dot_rows_kernel(const float* x, int n, const float* r, float* out) {
+    __shared__ float red[256];
+    const float d = proj_block_dot(x + (size_t) blockIdx.x * n, nullptr, r, n, red);
+    if (threadIdx.x == 0) out[blockIdx.x] = d;
+}
+
 __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16) {
     const int n = *d.pf_n;
     for (int i = 0; i < n; ++i) {
@@ -5615,6 +5646,19 @@ void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s) {
     if (d.cpu_seq == nullptr) return;
     moe_cpu_wait_kernel<<<1, 256, 0, s>>>(d, n_embd, out);
     launch_check("moe_cpu_wait");
+}
+
+void proj_rows(float* x, int T, int n, const float* sub, const float* sub_dot, const float* r, float scale,
+               cudaStream_t s) {
+    if (T <= 0) return;
+    proj_rows_kernel<<<(unsigned) T, 256, 0, s>>>(x, n, sub, sub_dot, r, scale);
+    launch_check("proj_rows");
+}
+
+void proj_dot_rows(const float* x, int T, int n, const float* r, float* out, cudaStream_t s) {
+    if (T <= 0) return;
+    proj_dot_rows_kernel<<<(unsigned) T, 256, 0, s>>>(x, n, r, out);
+    launch_check("proj_dot_rows");
 }
 
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {

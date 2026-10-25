@@ -818,6 +818,67 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = "glm fast: unresolved weights: " + missing.substr(0, 600);
         return false;
     }
+    // ---- STRATA_GLM_ROUTED_PROJ=<file>: a directional-ablation LoRA's edit of the routed experts' down projections
+    //      (one unit vector r and scale s a layer, the same for every expert: W_e -= s r r^T W_e) applied to their
+    //      weighted sum, y -= s r (r.y), instead of merged into every expert - whose finer requant costs VRAM slots and
+    //      CPU-lane time.  The file: "GRP1", n_embd, count (int32), then count x {layer (int32), s (f32), r (n_embd
+    //      f32)}.  A listed layer of this part must be a native MoE layer; the token path (fast_moe_experts, also the
+    //      rows') and the prompt path (prefill_half) apply it, the window path refuses it (fast_moe_window).
+    if (const char* pp = getenv("STRATA_GLM_ROUTED_PROJ"); pp != nullptr && *pp != '\0') {
+        std::FILE* pf = std::fopen(pp, "rb");
+        char magic[4] = {};
+        int32_t hdr[2] = {0, 0};
+        if (pf == nullptr || std::fread(magic, 1, 4, pf) != 4 || std::memcmp(magic, "GRP1", 4) != 0 ||
+            std::fread(hdr, sizeof(int32_t), 2, pf) != 2 || hdr[0] != g.n_embd || hdr[1] < 0 || hdr[1] > g.n_layers) {
+            if (pf != nullptr) std::fclose(pf);
+            err = std::string("glm proj: ") + pp + " is not a routed-projection file for this model (GRP1, n_embd " +
+                  std::to_string(g.n_embd) + ")";
+            return false;
+        }
+        std::vector<std::pair<int, float>> mine;   // this part's layers and scales
+        std::vector<float> rows, r((size_t) g.n_embd);
+        for (int i = 0; i < hdr[1]; ++i) {
+            int32_t il = -1;
+            float sc = 0.0f;
+            if (std::fread(&il, sizeof il, 1, pf) != 1 || std::fread(&sc, sizeof sc, 1, pf) != 1 ||
+                std::fread(r.data(), sizeof(float), r.size(), pf) != r.size() || il < 0 || il >= g.n_layers) {
+                std::fclose(pf);
+                err = std::string("glm proj: ") + pp + " is cut short or names a layer the model lacks";
+                return false;
+            }
+            if (il < l0_ || il >= l1_) continue;   // another part's
+            const auto& Ly = F->L[(size_t) il];
+            double nn = 0.0;
+            for (const float v : r) nn += (double) v * v;
+            if (!Ly.moe || Ly.exl3 || !(nn > 0.0) || !std::isfinite(sc)) {
+                std::fclose(pf);
+                err = "glm proj: layer " + std::to_string(il) + " is not a native MoE layer, or its vector is empty";
+                return false;
+            }
+            const float inv = (float) (1.0 / std::sqrt(nn));
+            for (float& v : r) v *= inv;
+            mine.emplace_back(il, sc);
+            rows.insert(rows.end(), r.begin(), r.end());
+        }
+        std::fclose(pf);
+        if (!mine.empty()) {
+            constexpr int kDotRows = 65536;   // the prompt path's rows a chunk (a longer chunk is refused there)
+            if (cudaMalloc((void**) &F->proj_mem, rows.size() * sizeof(float)) != cudaSuccess ||
+                cudaMalloc((void**) &F->proj_dot, (size_t) kDotRows * sizeof(float)) != cudaSuccess) {
+                err = "glm proj: the routed projection's buffers did not allocate";
+                return false;
+            }
+            cudaMemcpy(F->proj_mem, rows.data(), rows.size() * sizeof(float), cudaMemcpyHostToDevice);
+            F->proj_dot_cap = kDotRows;
+            for (size_t i = 0; i < mine.size(); ++i) {
+                auto& Ly = F->L[(size_t) mine[i].first];
+                Ly.proj_r = F->proj_mem + i * (size_t) g.n_embd;
+                Ly.proj_s = mine[i].second;
+            }
+            std::fprintf(stderr, "glm proj: CUDA%d the routed experts' sum projected on %zu layers (%d-%d), from %s\n",
+                         dev_, mine.size(), mine.front().first, mine.back().first, pp);
+        }
+    }
 
     // ---- the activation arena
     const int64_t E = g.n_embd, DI = g.d_inner(), FF = g.n_ff_exp * g.n_shared;
@@ -3718,6 +3779,8 @@ void Glm5Model::fast_destroy() {
     if (F->scratch) cudaFree(F->scratch);
     if (F->rows_scratch) cudaFree(F->rows_scratch);
     if (F->rows_scr) cudaFree(F->rows_scr);
+    if (F->proj_mem) cudaFree(F->proj_mem);
+    if (F->proj_dot) cudaFree(F->proj_dot);
     if (F->mtp_h) cudaFree(F->mtp_h);
     if (F->mtp_catq) cudaFree(F->mtp_catq);
     if (F->mtp_logits) cudaFree(F->mtp_logits);
@@ -5360,6 +5423,16 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     if (lane && !empty && !moe_defer_wait_) {
         gf::moe_cpu_wait(md, g.n_embd, io.ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
+    }
+    // the routed-expert projection (STRATA_GLM_ROUTED_PROJ), once the CPU lane's part is in the sum: io.ffn holds the
+    // routed experts and the shared expert's down (sh_out), and only the routed part is projected
+    if (Ly.proj_r != nullptr) {
+        if (lane && !empty && moe_defer_wait_) {
+            err = "glm proj: the routed projection needs the CPU lane's experts in their layer (not STRATA_GLM_DEFER_CPU)";
+            return false;
+        }
+        gf::proj_rows(io.ffn, 1, g.n_embd, Ly.sh_down.q != nullptr ? F->sh_out : nullptr, nullptr, Ly.proj_r,
+                      Ly.proj_s, s);
     }
     if (pf && pf_at == 2) issue_prefetch();
     if (pf) {
